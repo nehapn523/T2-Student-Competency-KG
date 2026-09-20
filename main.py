@@ -1,10 +1,21 @@
 from fastapi import FastAPI
 from neo4j import GraphDatabase
 import os
+import json
 
-app = FastAPI(title="Student Competency Knowledge Graph API")
+# ============================================================
+# FastAPI App
+# ============================================================
 
-# Neo4j Aura credentials
+app = FastAPI(
+    title="Student Competency Knowledge Graph API",
+    version="0.1.0"
+)
+
+# ============================================================
+# Neo4j Aura Configuration
+# ============================================================
+
 URI = os.getenv("NEO4J_URI")
 USERNAME = os.getenv("NEO4J_USERNAME")
 PASSWORD = os.getenv("NEO4J_PASSWORD")
@@ -14,6 +25,9 @@ driver = GraphDatabase.driver(
     auth=(USERNAME, PASSWORD)
 )
 
+# ============================================================
+# Home / Health Check
+# ============================================================
 
 @app.get("/")
 def home():
@@ -22,6 +36,153 @@ def home():
     }
 
 
+# ============================================================
+# T1 → T2
+# Create / Update Student Profile
+# ============================================================
+
+@app.post("/student")
+def create_student(profile: dict):
+
+    student_id = profile["student_id"]
+    name = profile["name"]
+    cgpa = profile.get("cgpa")
+
+    with driver.session() as session:
+
+        # ----------------------------------------------------
+        # Student
+        # ----------------------------------------------------
+
+        session.run(
+            """
+            MERGE (s:Student {id: $student_id})
+            SET s.name = $name,
+                s.cgpa = $cgpa
+            """,
+            student_id=student_id,
+            name=name,
+            cgpa=cgpa
+        )
+
+        # ----------------------------------------------------
+        # Skills
+        # ----------------------------------------------------
+
+        for skill in profile.get("skills", []):
+
+            session.run(
+                """
+                MERGE (sk:Skill {name: $skill})
+
+                WITH sk
+                MATCH (s:Student {id: $student_id})
+
+                MERGE (s)-[r:DEMONSTRATES]->(sk)
+
+                SET r.confidence_score = $confidence,
+                    r.source = $source,
+                    r.detail = $detail
+                """,
+                student_id=student_id,
+                skill=skill["skill"],
+                confidence=skill.get("confidence"),
+                source=skill.get("source"),
+                detail=skill.get("detail")
+            )
+
+        # ----------------------------------------------------
+        # Projects
+        # ----------------------------------------------------
+
+        for project in profile.get("projects", []):
+
+            session.run(
+                """
+                MERGE (p:Project {name: $name})
+
+                SET p.description = $description,
+                    p.source = $source
+
+                WITH p
+                MATCH (s:Student {id: $student_id})
+
+                MERGE (s)-[:WORKED_ON]->(p)
+                """,
+                student_id=student_id,
+                name=project["name"],
+                description=project.get("description"),
+                source=project.get("source")
+            )
+
+        # ----------------------------------------------------
+        # Certifications
+        # ----------------------------------------------------
+
+        for cert in profile.get("certifications", []):
+
+            session.run(
+                """
+                MERGE (c:Certification {name: $name})
+
+                SET c.issuer = $issuer,
+                    c.source = $source
+
+                WITH c
+                MATCH (s:Student {id: $student_id})
+
+                MERGE (s)-[:EARNED]->(c)
+                """,
+                student_id=student_id,
+                name=cert["name"],
+                issuer=cert.get("issuer"),
+                source=cert.get("source")
+            )
+
+        # ----------------------------------------------------
+        # Coding Statistics
+        # ----------------------------------------------------
+
+        for stat in profile.get("coding_stats", []):
+
+            # Neo4j properties cannot directly store an
+            # arbitrary Python dictionary, so convert
+            # metrics into a JSON string.
+            metrics_json = json.dumps(
+                stat.get("metrics", {})
+            )
+
+            session.run(
+                """
+                MERGE (cp:CodingProfile {
+                    platform: $platform,
+                    handle: $handle
+                })
+
+                SET cp.metrics = $metrics
+
+                WITH cp
+                MATCH (s:Student {id: $student_id})
+
+                MERGE (s)-[:HAS_CODING_PROFILE]->(cp)
+                """,
+                student_id=student_id,
+                platform=stat["platform"],
+                handle=stat["handle"],
+                metrics=metrics_json
+            )
+
+    return {
+        "message": "Student profile loaded successfully",
+        "studentId": student_id
+    }
+
+
+# ============================================================
+# T2 → T4
+# Get Student Profile
+# ============================================================
+
 @app.get("/student/{student_id}")
 def get_student(student_id: str):
 
@@ -29,52 +190,103 @@ def get_student(student_id: str):
     MATCH (s:Student {id: $student_id})
 
     OPTIONAL MATCH (s)-[d:DEMONSTRATES]->(sk:Skill)
+
     WITH s,
          collect({
              name: sk.name,
              confidence: d.confidence_score,
-             source: d.source
+             source: d.source,
+             detail: d.detail
          }) AS skills
 
     OPTIONAL MATCH (s)-[:WORKED_ON]->(p:Project)
-    WITH s, skills,
+
+    WITH s,
+         skills,
          collect({
-             name: p.name
+             name: p.name,
+             description: p.description,
+             source: p.source
          }) AS projects
 
-    OPTIONAL MATCH (s)-[:STUDIED]->(c:Course)
-    WITH s, skills, projects,
-         collect({
-             name: c.name
-         }) AS courses
+    OPTIONAL MATCH (s)-[:EARNED]->(c:Certification)
 
-    OPTIONAL MATCH (s)-[:EARNED]->(cert:Certification)
+    WITH s,
+         skills,
+         projects,
+         collect({
+             name: c.name,
+             issuer: c.issuer,
+             source: c.source
+         }) AS certifications
+
+    OPTIONAL MATCH (s)-[:HAS_CODING_PROFILE]->(cp:CodingProfile)
+
     RETURN s,
            skills,
            projects,
-           courses,
+           certifications,
            collect({
-               name: cert.name
-           }) AS certifications
+               platform: cp.platform,
+               handle: cp.handle,
+               metrics: cp.metrics
+           }) AS coding_stats
     """
 
     with driver.session() as session:
+
         result = session.run(
             query,
             student_id=student_id
         ).single()
 
+    # --------------------------------------------------------
+    # Student Not Found
+    # --------------------------------------------------------
+
     if result is None:
+
         return {
             "error": "Student not found",
             "studentId": student_id
         }
 
+    # --------------------------------------------------------
+    # Convert metrics JSON string back into JSON object
+    # --------------------------------------------------------
+
+    coding_stats = []
+
+    for stat in result["coding_stats"]:
+
+        metrics = stat["metrics"]
+
+        if isinstance(metrics, str):
+
+            try:
+                metrics = json.loads(metrics)
+
+            except json.JSONDecodeError:
+                pass
+
+        coding_stats.append({
+            "platform": stat["platform"],
+            "handle": stat["handle"],
+            "metrics": metrics
+        })
+
+    # --------------------------------------------------------
+    # Student information
+    # --------------------------------------------------------
+
+    student = result["s"]
+
     return {
-        "studentId": result["s"]["id"],
-        "studentName": result["s"]["name"],
+        "studentId": student["id"],
+        "studentName": student["name"],
+        "cgpa": student.get("cgpa"),
         "skills": result["skills"],
         "projects": result["projects"],
-        "courses": result["courses"],
-        "certifications": result["certifications"]
+        "certifications": result["certifications"],
+        "coding_stats": coding_stats
     }
