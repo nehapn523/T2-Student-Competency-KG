@@ -25,6 +25,7 @@ driver = GraphDatabase.driver(
     auth=(USERNAME, PASSWORD)
 )
 
+
 # ============================================================
 # Home / Health Check
 # ============================================================
@@ -145,9 +146,6 @@ def create_student(profile: dict):
 
         for stat in profile.get("coding_stats", []):
 
-            # Neo4j properties cannot directly store an
-            # arbitrary Python dictionary, so convert
-            # metrics into a JSON string.
             metrics_json = json.dumps(
                 stat.get("metrics", {})
             )
@@ -179,8 +177,52 @@ def create_student(profile: dict):
 
 
 # ============================================================
+# Get All Students
+# T4 can use this to get available student IDs
+# ============================================================
+
+@app.get("/students")
+def get_all_students():
+
+    query = """
+    MATCH (s:Student)
+    RETURN s.id AS studentId,
+           s.name AS studentName,
+           s.cgpa AS cgpa
+    ORDER BY s.id
+    """
+
+    try:
+
+        with driver.session() as session:
+
+            result = session.run(query)
+
+            students = []
+
+            for record in result:
+
+                students.append({
+                    "studentId": record["studentId"],
+                    "studentName": record["studentName"],
+                    "cgpa": record["cgpa"]
+                })
+
+        return {
+            "students": students
+        }
+
+    except Exception as e:
+
+        return {
+            "error": "Failed to retrieve students",
+            "details": str(e)
+        }
+
+
+# ============================================================
 # T2 → T4
-# Get Student Profile
+# Get Individual Student Profile
 # ============================================================
 
 @app.get("/student/{student_id}")
@@ -233,12 +275,22 @@ def get_student(student_id: str):
            }) AS coding_stats
     """
 
-    with driver.session() as session:
+    try:
 
-        result = session.run(
-            query,
-            student_id=student_id
-        ).single()
+        with driver.session() as session:
+
+            result = session.run(
+                query,
+                student_id=student_id
+            ).single()
+
+    except Exception as e:
+
+        return {
+            "error": "Failed to retrieve student",
+            "studentId": student_id,
+            "details": str(e)
+        }
 
     # --------------------------------------------------------
     # Student Not Found
@@ -252,7 +304,7 @@ def get_student(student_id: str):
         }
 
     # --------------------------------------------------------
-    # Convert metrics JSON string back into JSON object
+    # Convert metrics JSON string back to JSON object
     # --------------------------------------------------------
 
     coding_stats = []
@@ -276,7 +328,7 @@ def get_student(student_id: str):
         })
 
     # --------------------------------------------------------
-    # Student information
+    # Student Information
     # --------------------------------------------------------
 
     student = result["s"]
